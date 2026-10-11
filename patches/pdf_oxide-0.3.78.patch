@@ -1,0 +1,1136 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 854eeb2..a0891cc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2756,6 +2756,7 @@ dependencies = [
+  "log",
+  "md-5",
+  "memchr",
++ "memmap2",
+  "ndarray 0.17.2",
+  "nom 8.0.0",
+  "office_oxide",
+diff --git a/Cargo.toml b/Cargo.toml
+index 3273a48..82736ec 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -143,6 +143,7 @@ regex = "1.13"
+ 
+ # Data structures
+ bytes = "1.12"
++memmap2 = "0.9"
+ memchr = "2"      # SIMD-accelerated byte/substring search for content stream scanning
+ byteorder = "1.5" # For binary parsing (TrueType cmap tables)
+ bitflags = "2"    # For form field flags
+diff --git a/src/content/parser.rs b/src/content/parser.rs
+index a1ad102..c3775c6 100644
+--- a/src/content/parser.rs
++++ b/src/content/parser.rs
+@@ -1390,13 +1390,362 @@ fn find_matching_et(data: &[u8], start: usize) -> Option<usize> {
+ /// they truncate differently on hostile bytes between text regions. Extraction
+ /// must route every mode through this parser (see
+ /// `TextExtractor::run_content_stream`).
++/// When set, [`TextExtractor`](crate::extractors::TextExtractor) runs content
++/// streams through [`parse_and_execute_lean`].
++pub static LEAN_SCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++const LC_WS: u8 = 0;
++const LC_NUM: u8 = 1;
++const LC_OP: u8 = 2;
++const LC_NAME: u8 = 3;
++const LC_PAREN: u8 = 4;
++const LC_ANGLE: u8 = 5;
++const LC_BRACKET: u8 = 6;
++const LC_COMMENT: u8 = 7;
++const LC_JUNK: u8 = 8;
++
++/// Token-start classes for [`parse_and_execute_lean`].
++static LEAN_CLASS: [u8; 256] = {
++    let mut t = [LC_JUNK; 256];
++    let mut b = 0usize;
++    while b < 256 {
++        let c = b as u8;
++        t[b] = match c {
++            0 | b'\t' | b'\n' | 0x0c | b'\r' | b' ' => LC_WS,
++            b'0'..=b'9' | b'+' | b'-' | b'.' => LC_NUM,
++            b'a'..=b'z' | b'A'..=b'Z' | b'\'' | b'"' | b'*' => LC_OP,
++            b'/' => LC_NAME,
++            b'(' => LC_PAREN,
++            b'<' => LC_ANGLE,
++            b'[' => LC_BRACKET,
++            b'%' => LC_COMMENT,
++            _ => LC_JUNK,
++        };
++        b += 1;
++    }
++    t
++};
++
++/// One operator with the byte offsets of its operands, kept unparsed until
++/// it is known that the operator has to be executed.
++#[derive(Clone, Copy)]
++struct LeanTok {
++    /// Start offsets of the last (up to 8) operands.
++    starts: [u32; 8],
++    /// Operands seen before the operator, saturating at 255.
++    n: u8,
++    /// Start of the first operand (or of the operator when it has none).
++    first: u32,
++    op_start: u32,
++    op_end: u32,
++}
++
++enum LeanKind {
++    /// Cannot affect text: path construction/painting, clipping, line style,
++    /// colour, shading.
++    Skip,
++    Save,
++    Restore,
++    /// Changes graphics state only; unobservable if the enclosing `q` is
++    /// restored before anything is drawn through it.
++    State,
++    InlineImage,
++    Emit,
++}
++
++#[inline]
++fn lean_kind(op: &[u8]) -> LeanKind {
++    match op {
++        b"q" => LeanKind::Save,
++        b"Q" => LeanKind::Restore,
++        b"cm" | b"gs" => LeanKind::State,
++        b"BI" => LeanKind::InlineImage,
++        b"m" | b"l" | b"c" | b"v" | b"y" | b"h" | b"re" | b"S" | b"s" | b"f" | b"F" | b"f*"
++        | b"B" | b"B*" | b"b" | b"b*" | b"n" | b"W" | b"W*" | b"w" | b"J" | b"j" | b"M"
++        | b"d" | b"i" | b"ri" | b"sh" | b"rg" | b"RG" | b"g" | b"G" | b"k" | b"K" | b"cs"
++        | b"CS" | b"sc" | b"SC" | b"scn" | b"SCN" | b"BX" | b"EX" => LeanKind::Skip,
++        _ => LeanKind::Emit,
++    }
++}
++
++/// Build the operator for `t` straight from the bytes, or `None` when it is
++/// not one of the plain shapes handled here (the caller then falls back to
++/// the general parser for that one operator).
++fn lean_build(data: &[u8], t: &LeanTok) -> Option<Operator> {
++    let op = &data[t.op_start as usize..t.op_end as usize];
++    let n = t.n as usize;
++    if n > 8 {
++        return None;
++    }
++    let num = |k: usize| -> Option<f32> {
++        let s = t.starts[k] as usize;
++        let (v, used) = parse_float_fast(&data[s..])?;
++        // The whole token must be one plain decimal.
++        match data.get(s + used) {
++            Some(&b) if LEAN_CLASS[b as usize] == LC_NUM || b == b'e' || b == b'E' => None,
++            _ => Some(v),
++        }
++    };
++    let string = |k: usize| -> Option<Vec<u8>> {
++        let s = t.starts[k] as usize;
++        match data[s] {
++            b'(' => parse_literal_string_fast(data, s).map(|r| r.0),
++            b'<' if data.get(s + 1) != Some(&b'<') => parse_hex_string_fast(data, s).map(|r| r.0),
++            _ => None,
++        }
++    };
++    let name = |k: usize| -> Option<String> {
++        let s = t.starts[k] as usize;
++        if data[s] != b'/' {
++            return None;
++        }
++        let (name, _) = parse_name_fast(data, s);
++        // `#xx` escapes are left to the general parser.
++        if name.contains('#') {
++            None
++        } else {
++            Some(name)
++        }
++    };
++    Some(match (op, n) {
++        (b"q", _) => Operator::SaveState,
++        (b"BT", 0) => Operator::BeginText,
++        (b"ET", 0) => Operator::EndText,
++        (b"T*", 0) => Operator::TStar,
++        (b"EMC", 0) => Operator::EndMarkedContent,
++        (b"Td", 2) => Operator::Td {
++            tx: num(0)?,
++            ty: num(1)?,
++        },
++        (b"TD", 2) => Operator::TD {
++            tx: num(0)?,
++            ty: num(1)?,
++        },
++        (b"Tm", 6) => Operator::Tm {
++            a: num(0)?,
++            b: num(1)?,
++            c: num(2)?,
++            d: num(3)?,
++            e: num(4)?,
++            f: num(5)?,
++        },
++        (b"cm", 6) => Operator::Cm {
++            a: num(0)?,
++            b: num(1)?,
++            c: num(2)?,
++            d: num(3)?,
++            e: num(4)?,
++            f: num(5)?,
++        },
++        (b"Tj", 1) => Operator::Tj { text: string(0)? },
++        (b"'", 1) => Operator::Quote { text: string(0)? },
++        (b"\"", 3) => Operator::DoubleQuote {
++            word_space: num(0)?,
++            char_space: num(1)?,
++            text: string(2)?,
++        },
++        (b"TJ", 1) if data[t.starts[0] as usize] == b'[' => Operator::TJ {
++            array: parse_tj_array_fast(data, t.starts[0] as usize)?.0,
++        },
++        (b"Tc", 1) => Operator::Tc {
++            char_space: num(0)?,
++        },
++        (b"Tw", 1) => Operator::Tw {
++            word_space: num(0)?,
++        },
++        (b"Tz", 1) => Operator::Tz { scale: num(0)? },
++        (b"TL", 1) => Operator::TL { leading: num(0)? },
++        (b"Ts", 1) => Operator::Ts { rise: num(0)? },
++        (b"Tf", 2) => Operator::Tf {
++            font: name(0)?,
++            size: num(1)?,
++        },
++        (b"Do", 1) => Operator::Do { name: name(0)? },
++        (b"gs", 1) => Operator::SetExtGState {
++            dict_name: name(0)?,
++        },
++        (b"BMC", 1) => Operator::BeginMarkedContent { tag: name(0)? },
++        _ => return None,
++    })
++}
++
++/// Execute a content stream for text extraction in one linear pass.
++///
++/// Operands are only located, never parsed, until their operator turns out to
++/// matter, so the path data that dominates drawings costs a table lookup per
++/// byte. `q … Q` groups that draw nothing but paths are dropped whole,
++/// including any `cm`/`gs` inside them. Colour operators are not delivered:
++/// callers that need span colours must use [`parse_and_execute_text_only`].
++pub fn parse_and_execute_lean<F>(data: &[u8], mut handler: F) -> Result<()>
++where
++    F: FnMut(Operator) -> Result<()>,
++{
++    let len = data.len();
++    if len >= u32::MAX as usize {
++        return parse_and_execute_text_only(data, handler);
++    }
++    let emit = |t: &LeanTok, handler: &mut F| -> Result<()> {
++        if let Some(op) = lean_build(data, t) {
++            return handler(op);
++        }
++        if let Ok((_, op)) = parse_operator_with_operands(&data[t.first as usize..t.op_end as usize])
++        {
++            handler(op)?;
++        }
++        Ok(())
++    };
++
++    let mut i = 0usize;
++    let mut starts = [0u32; 8];
++    let mut n = 0usize;
++    let mut first = 0u32;
++    // Operators held back because an enclosing `q` may yet be restored
++    // without anything having been drawn; `q_marks` indexes the `q`s in it.
++    let mut pending: Vec<LeanTok> = Vec::new();
++    let mut q_marks: Vec<u32> = Vec::new();
++
++    macro_rules! operand {
++        ($at:expr) => {{
++            if n == 0 {
++                first = $at as u32;
++            }
++            if n < 8 {
++                starts[n] = $at as u32;
++            } else {
++                starts.copy_within(1.., 0);
++                starts[7] = $at as u32;
++            }
++            n += 1;
++        }};
++    }
++
++    loop {
++        while i < len && LEAN_CLASS[data[i] as usize] == LC_WS {
++            i += 1;
++        }
++        if i >= len {
++            break;
++        }
++        match LEAN_CLASS[data[i] as usize] {
++            LC_NUM => {
++                operand!(i);
++                i += 1;
++                while i < len && LEAN_CLASS[data[i] as usize] == LC_NUM {
++                    i += 1;
++                }
++            },
++            LC_OP => {
++                let s = i;
++                i += 1;
++                if data[s] != b'\'' && data[s] != b'"' {
++                    while i < len && (data[i].is_ascii_alphanumeric() || data[i] == b'*') {
++                        i += 1;
++                    }
++                }
++                let op = &data[s..i];
++                if matches!(op, b"true" | b"false" | b"null") {
++                    operand!(s);
++                    continue;
++                }
++                let tok = LeanTok {
++                    starts,
++                    n: n.min(255) as u8,
++                    first: if n == 0 { s as u32 } else { first },
++                    op_start: s as u32,
++                    op_end: i as u32,
++                };
++                n = 0;
++                match lean_kind(op) {
++                    LeanKind::Skip => {},
++                    LeanKind::Save => {
++                        q_marks.push(pending.len() as u32);
++                        pending.push(tok);
++                    },
++                    LeanKind::Restore => match q_marks.pop() {
++                        Some(mark) => pending.truncate(mark as usize),
++                        None => handler(Operator::RestoreState)?,
++                    },
++                    LeanKind::State => {
++                        if q_marks.is_empty() {
++                            emit(&tok, &mut handler)?;
++                        } else {
++                            pending.push(tok);
++                        }
++                    },
++                    LeanKind::InlineImage => {
++                        if let Ok((rest, _)) = parse_inline_image(&data[i..]) {
++                            i = len - rest.len();
++                        }
++                    },
++                    LeanKind::Emit => {
++                        if !pending.is_empty() {
++                            for t in &pending {
++                                emit(t, &mut handler)?;
++                            }
++                            pending.clear();
++                            q_marks.clear();
++                        }
++                        emit(&tok, &mut handler)?;
++                    },
++                }
++            },
++            LC_NAME => {
++                operand!(i);
++                i = skip_name_raw(data, i).max(i + 1);
++            },
++            LC_PAREN => match skip_literal_string_raw(data, i) {
++                Some(end) => {
++                    operand!(i);
++                    i = end;
++                },
++                None => i += 1,
++            },
++            LC_ANGLE => {
++                let end = if data.get(i + 1) == Some(&b'<') {
++                    skip_dict_raw(data, i)
++                } else {
++                    skip_hex_string_raw(data, i)
++                };
++                match end {
++                    Some(end) => {
++                        operand!(i);
++                        i = end;
++                    },
++                    None => i += 1,
++                }
++            },
++            LC_BRACKET => match skip_array_raw(data, i) {
++                Some(end) => {
++                    operand!(i);
++                    i = end;
++                },
++                None => i += 1,
++            },
++            LC_COMMENT => {
++                while i < len && data[i] != b'\n' && data[i] != b'\r' {
++                    i += 1;
++                }
++            },
++            _ => i += 1,
++        }
++    }
++    Ok(())
++}
++
++/// When set, large streams are scanned linearly instead of through the
++/// region pre-scan, whose reconstructed graphics state is only approximate.
++pub static NO_PRESCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// Execute a content stream for text extraction, skipping path data where
++/// it can; large streams go through the region pre-scan unless
++/// [`NO_PRESCAN`] is set.
+ pub fn parse_and_execute_text_only<F>(data: &[u8], mut handler: F) -> Result<()>
+ where
+     F: FnMut(Operator) -> Result<()>,
+ {
+     // For large streams (>256KB), use SIMD pre-scan to identify text regions.
+     // This avoids byte-by-byte scanning of megabytes of path/color operators.
+-    if data.len() > 256 * 1024 {
++    if data.len() > 256 * 1024 && !NO_PRESCAN.load(std::sync::atomic::Ordering::Relaxed) {
+         if let Some(result) = prescan_text_regions(data) {
+             match result {
+                 PrescanResult::Empty => return Ok(()),
+diff --git a/src/document.rs b/src/document.rs
+index 7a2471e..9e7955b 100644
+--- a/src/document.rs
++++ b/src/document.rs
+@@ -66,12 +66,17 @@ pub enum ReadingOrder {
+ /// sites.
+ enum PdfReader {
+     Memory(BufReader<Cursor<Vec<u8>>>),
++    /// The file mapped read-only: only the pages actually parsed are touched.
++    #[cfg(not(target_arch = "wasm32"))]
++    Mapped(BufReader<Cursor<memmap2::Mmap>>),
+ }
+ 
+ impl Read for PdfReader {
+     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+         match self {
+             PdfReader::Memory(r) => r.read(buf),
++            #[cfg(not(target_arch = "wasm32"))]
++            PdfReader::Mapped(r) => r.read(buf),
+         }
+     }
+ }
+@@ -80,6 +85,8 @@ impl Seek for PdfReader {
+     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+         match self {
+             PdfReader::Memory(r) => r.seek(pos),
++            #[cfg(not(target_arch = "wasm32"))]
++            PdfReader::Mapped(r) => r.seek(pos),
+         }
+     }
+ }
+@@ -88,12 +95,16 @@ impl BufRead for PdfReader {
+     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+         match self {
+             PdfReader::Memory(r) => r.fill_buf(),
++            #[cfg(not(target_arch = "wasm32"))]
++            PdfReader::Mapped(r) => r.fill_buf(),
+         }
+     }
+ 
+     fn consume(&mut self, amt: usize) {
+         match self {
+             PdfReader::Memory(r) => r.consume(amt),
++            #[cfg(not(target_arch = "wasm32"))]
++            PdfReader::Mapped(r) => r.consume(amt),
+         }
+     }
+ }
+@@ -1135,6 +1146,21 @@ impl PdfDocument {
+         Self::from_bytes(data)
+     }
+ 
++    /// Open a PDF by memory-mapping it instead of reading it into the heap.
++    ///
++    /// Nothing is copied up front, so a caller that wants two pages of a
++    /// 40 MB file pays for the xref and those pages only. `source_bytes` stays
++    /// empty, which rules out the editing/conversion APIs that re-read it.
++    /// The file must not be truncated while the document is alive.
++    #[cfg(not(target_arch = "wasm32"))]
++    pub fn open_mapped(path: impl AsRef<Path>) -> Result<Self> {
++        let file = std::fs::File::open(path.as_ref())?;
++        // SAFETY: the mapping is read-only and private to this document; the
++        // caller upholds the no-truncation contract documented above.
++        let map = unsafe { memmap2::Mmap::map(&file)? };
++        Self::open_from_reader(PdfReader::Mapped(BufReader::new(Cursor::new(map))))
++    }
++
+     fn open_from_reader(mut reader: PdfReader) -> Result<Self> {
+         // Parse header with lenient mode by default (handle PDFs with binary prefixes)
+         let (major, minor, header_offset) = parse_header(&mut reader, true)?;
+@@ -9802,7 +9828,9 @@ impl PdfDocument {
+         spans
+     }
+ 
+-    fn extract_widget_spans(&self, page_index: usize) -> Vec<TextSpan> {
++    /// One span per visible form-field widget on the page, carrying the
++    /// field's value at the widget's `/Rect`.
++    pub fn extract_widget_spans(&self, page_index: usize) -> Vec<TextSpan> {
+         use crate::extractors::forms::field_flags;
+         use crate::geometry::Rect;
+ 
+@@ -17135,7 +17163,7 @@ impl PdfDocument {
+     /// This is the common extraction logic shared by `extract_spans`
+     /// `extract_spans_with_reading_order`. Spans are returned without any
+     /// sorting or erase-region filtering applied.
+-    fn extract_spans_raw(&self, page_index: usize) -> Result<Vec<crate::layout::TextSpan>> {
++    pub fn extract_spans_raw(&self, page_index: usize) -> Result<Vec<crate::layout::TextSpan>> {
+         self.extract_spans_raw_with_extraction_config(
+             page_index,
+             crate::extractors::TextExtractionConfig::default(),
+diff --git a/src/extractors/text.rs b/src/extractors/text.rs
+index 630781f..765fc75 100644
+--- a/src/extractors/text.rs
++++ b/src/extractors/text.rs
+@@ -164,6 +164,11 @@ impl SpaceDecision {
+     }
+ }
+ 
++/// When set, [`TextExtractor::extract_text_spans`] returns spans straight from
++/// the content stream: no reading-order sort, de-duplication, span merging or
++/// `/PlacedPDF` suppression.
++pub static LEAN_SPANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
+ /// Configuration for text extraction heuristics.
+ ///
+ /// PDF spec does not define explicit rules for many spacing scenarios.
+@@ -3454,7 +3459,10 @@ impl<'doc> TextExtractor<'doc> {
+         self.span_sequence_counter = 0; // Reset sequence counter for this page
+                                         // Decide per page whether a whole-body `/PlacedPDF` region must be kept
+                                         // rather than suppressed (see `placed_pdf_text_dominates`).
+-        self.placed_pdf_keep = Self::placed_pdf_text_dominates(content_stream);
++        let lean = LEAN_SPANS.load(std::sync::atomic::Ordering::Relaxed);
++        // Lean mode keeps /PlacedPDF text (as pdftotext does) and skips the
++        // full-stream pre-scan that decides whether to suppress it.
++        self.placed_pdf_keep = lean || Self::placed_pdf_text_dominates(content_stream);
+ 
+         extract_log_debug!("Parsing content stream for text extraction");
+         self.run_content_stream(content_stream)?;
+@@ -3464,6 +3472,12 @@ impl<'doc> TextExtractor<'doc> {
+ 
+         // Detect RTL glyph DRAW DIRECTION on the raw stream order, BEFORE the
+         // reading-order sort destroys it (ISO 32000-1 §14.8.2.3.3 method 1).
++        if lean {
++            // Positioned spans exactly as the content stream placed them; the
++            // caller does its own line assembly.
++            return Ok(std::mem::take(&mut self.spans));
++        }
++
+         self.detect_rtl_draw_direction();
+ 
+         // Sort spans by reading order (top-to-bottom, left-to-right)
+@@ -3584,6 +3598,10 @@ impl<'doc> TextExtractor<'doc> {
+                 self.execute_operator(op)?;
+             }
+             Ok(())
++        } else if crate::content::parser::LEAN_SCAN.load(std::sync::atomic::Ordering::Relaxed) {
++            crate::content::parser::parse_and_execute_lean(content_stream, |op| {
++                self.execute_operator(op)
++            })
+         } else {
+             parse_and_execute_text_only(content_stream, |op| self.execute_operator(op))
+         }
+@@ -5287,6 +5305,16 @@ impl<'doc> TextExtractor<'doc> {
+     ///
+     /// Updates the graphics state and extracts text as appropriate.
+     fn execute_operator(&mut self, op: Operator) -> Result<()> {
++        // Lean mode never joins runs across a repositioning: whether the gap
++        // it leaves is a word break is decided later from the geometry, not
++        // guessed here from the operator stream.
++        if matches!(
++            op,
++            Operator::Td { .. } | Operator::TD { .. } | Operator::Tm { .. } | Operator::TStar
++        ) && LEAN_SPANS.load(std::sync::atomic::Ordering::Relaxed)
++        {
++            self.flush_tj_span_buffer()?;
++        }
+         match op {
+             // Text state operators
+             Operator::Tf { font, size } => {
+diff --git a/src/fonts/cmap.rs b/src/fonts/cmap.rs
+index 9dd4407..b1f1868 100644
+--- a/src/fonts/cmap.rs
++++ b/src/fonts/cmap.rs
+@@ -24,7 +24,6 @@
+ 
+ use crate::cache::MutexExt;
+ use crate::error::Result;
+-use regex::Regex;
+ use std::collections::hash_map::DefaultHasher;
+ use std::collections::HashMap;
+ use std::hash::{Hash, Hasher};
+@@ -696,8 +695,10 @@ pub(crate) fn parse_wmode_directive_public(content: &str) -> Option<u8> {
+ }
+ 
+ fn parse_wmode_directive(content: &str) -> Option<u8> {
+-    static RE: std::sync::LazyLock<Regex> =
+-        std::sync::LazyLock::new(|| Regex::new(r"/WMode\s+([0-9]+)\s+def").unwrap());
++    // Almost no CMap carries the directive; skip the comment stripping then.
++    if !content.contains("/WMode") {
++        return None;
++    }
+     // PostScript comments run from `%` to end-of-line (Adobe PostScript
+     // Language Reference §3.3.1). Strip them so a commented-out directive
+     // like `% /WMode 1 def` does not flip the writing mode. Keep newlines
+@@ -711,8 +712,7 @@ fn parse_wmode_directive(content: &str) -> Option<u8> {
+         })
+         .collect::<Vec<_>>()
+         .join("\n");
+-    let caps = RE.captures(&cleaned)?;
+-    let value: u32 = caps[1].parse().ok()?;
++    let value: u32 = find_wmode_value(&cleaned)?.parse().ok()?;
+     match value {
+         0 => Some(0),
+         1 => Some(1),
+@@ -740,13 +740,10 @@ fn parse_wmode_directive(content: &str) -> Option<u8> {
+ /// Returns 1 if the line does not contain a valid codespace pair, or 2 if at
+ /// least one 2-byte (4-hex-digit) entry is found.
+ fn parse_codespacerange_line_width(line: &str) -> u8 {
+-    static RE: std::sync::LazyLock<Regex> =
+-        std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>\s*<([^>]*)>").unwrap());
+-
+     let mut max_width: u8 = 1;
+-    for caps in RE.captures_iter(line) {
+-        let lo_hex = caps[1].trim().replace(char::is_whitespace, "");
+-        let hi_hex = caps[2].trim().replace(char::is_whitespace, "");
++    for caps in AngleGroups::<2>::new(line) {
++        let lo_hex = caps[0].trim().replace(char::is_whitespace, "");
++        let hi_hex = caps[1].trim().replace(char::is_whitespace, "");
+         // 4 or more hex digits mean ≥2-byte codes.
+         if lo_hex.len() >= 4 || hi_hex.len() >= 4 {
+             max_width = 2;
+@@ -764,17 +761,14 @@ fn parse_codespacerange_line_width(line: &str) -> u8 {
+ /// Supports multiple pairs per line, hex code points, ligatures, escape sequences,
+ /// and flexible whitespace inside angle brackets.
+ fn parse_bfchar_line(line: &str) -> Vec<(u32, String)> {
+-    static RE: std::sync::LazyLock<Regex> =
+-        std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>\s*<([^>]*)>").unwrap());
+-
+     let mut results = Vec::new();
+ 
+-    for caps in RE.captures_iter(line) {
++    for caps in AngleGroups::<2>::new(line) {
+         let parsed = (|| -> Option<(u32, String)> {
+-            let src_str = caps[1].trim().replace(char::is_whitespace, "");
++            let src_str = caps[0].trim().replace(char::is_whitespace, "");
+             let src = u32::from_str_radix(&src_str, 16).ok()?;
+ 
+-            let dst_str = caps[2].trim();
++            let dst_str = caps[1].trim();
+ 
+             let dst = if let Some(escape) = parse_escape_sequence(&format!("<{}>", dst_str)) {
+                 escape
+@@ -848,35 +842,21 @@ fn parse_bfchar_line(line: &str) -> Vec<(u32, String)> {
+ ///
+ /// This function supports both formats and flexible whitespace within angle brackets.
+ fn parse_bfrange_line(line: &str) -> Option<Vec<(u32, String)>> {
+-    static RE_SEQ: std::sync::LazyLock<Regex> =
+-        std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>\s*<([^>]*)>\s*<([^>]*)>").unwrap());
+-    static RE_ARRAY: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+-        Regex::new(r"<([^>]*)>\s*<([^>]*)>\s*\[((?:\s*<[^>]+>\s*)+)\]").unwrap()
+-    });
+ 
+     // Try format 2 first (array format)
+     // Example: <005F> <0061> [<00660066> <00660069> <00660066006C>]
+     // Maps codes 0x5F, 0x60, 0x61 to "ff", "fi", "ffl" respectively
+-    if let Some(caps) = RE_ARRAY.captures(line) {
+-        let start_str = caps[1].trim().replace(char::is_whitespace, "");
+-        let end_str = caps[2].trim().replace(char::is_whitespace, "");
++    if let Some((lo, hi, array_str)) = find_bfrange_array(line) {
++        let start_str = lo.trim().replace(char::is_whitespace, "");
++        let end_str = hi.trim().replace(char::is_whitespace, "");
+         let start = u32::from_str_radix(&start_str, 16).ok()?;
+         let end = u32::from_str_radix(&end_str, 16).ok()?;
+-        let array_str = &caps[3];
+ 
+         // Extract all destination hex strings from array
+         // Each can be a single Unicode code point OR multiple code points (for ligatures)
+-        static RE_HEX: std::sync::LazyLock<Regex> =
+-            std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>").unwrap());
+-        let dst_hexes: Vec<String> = RE_HEX
+-            .captures_iter(array_str)
++        let dst_hexes: Vec<String> = AngleGroups::<1>::new(array_str)
+             .filter_map(|cap| {
+-                let s = cap
+-                    .get(1)
+-                    .unwrap()
+-                    .as_str()
+-                    .trim()
+-                    .replace(char::is_whitespace, "");
++                let s = cap[0].trim().replace(char::is_whitespace, "");
+                 if !s.is_empty() {
+                     Some(s)
+                 } else {
+@@ -965,10 +945,10 @@ fn parse_bfrange_line(line: &str) -> Option<Vec<(u32, String)>> {
+     }
+ 
+     // Try format 1 (sequential format)
+-    if let Some(caps) = RE_SEQ.captures(line) {
+-        let start_str = caps[1].trim().replace(char::is_whitespace, "");
+-        let end_str = caps[2].trim().replace(char::is_whitespace, "");
+-        let dst_start_str = caps[3].trim().replace(char::is_whitespace, "");
++    if let Some(caps) = AngleGroups::<3>::new(line).next() {
++        let start_str = caps[0].trim().replace(char::is_whitespace, "");
++        let end_str = caps[1].trim().replace(char::is_whitespace, "");
++        let dst_start_str = caps[2].trim().replace(char::is_whitespace, "");
+         let start = u32::from_str_radix(&start_str, 16).ok()?;
+         let end = u32::from_str_radix(&end_str, 16).ok()?;
+         let dst_start = u32::from_str_radix(&dst_start_str, 16).ok()?;
+@@ -1016,13 +996,10 @@ fn parse_bfrange_line(line: &str) -> Option<Vec<(u32, String)>> {
+ /// Unlike bfrange, notdefrange only supports the sequential format (not arrays).
+ /// Notdefrange mappings are applied only to codes not already mapped by bfchar/bfrange.
+ fn parse_notdefrange_line(line: &str) -> Option<Vec<(u32, String)>> {
+-    static RE_SEQ: std::sync::LazyLock<Regex> =
+-        std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>\s*<([^>]*)>\s*<([^>]*)>").unwrap());
+-
+-    if let Some(caps) = RE_SEQ.captures(line) {
+-        let start_str = caps[1].trim().replace(char::is_whitespace, "");
+-        let end_str = caps[2].trim().replace(char::is_whitespace, "");
+-        let dst_str = caps[3].trim();
++    if let Some(caps) = AngleGroups::<3>::new(line).next() {
++        let start_str = caps[0].trim().replace(char::is_whitespace, "");
++        let end_str = caps[1].trim().replace(char::is_whitespace, "");
++        let dst_str = caps[2].trim();
+ 
+         let start = u32::from_str_radix(&start_str, 16).ok()?;
+         let end = u32::from_str_radix(&end_str, 16).ok()?;
+@@ -1489,3 +1466,232 @@ endcmap
+         );
+     }
+ }
++
++// ── Hand-rolled matchers ───────────────────────────────────────────────────
++//
++// The CMap line grammar used to be matched with `regex`. Compiling those
++// patterns cost more than parsing the CMap itself in a process that reads a
++// handful of fonts, so the same leftmost matches are found by scanning. The
++// equivalence is pinned against the original patterns in the tests below.
++
++/// Offset of the first non-whitespace character at or after `pos`.
++fn skip_cmap_ws(s: &str, pos: usize) -> usize {
++    let rest = &s[pos..];
++    pos + (rest.len() - rest.trim_start().len())
++}
++
++/// Match `K` consecutive `<…>` groups separated by optional whitespace and
++/// anchored at byte `at`. Returns the group contents and the offset just past
++/// the last `>`.
++fn angle_groups_at<const K: usize>(s: &str, at: usize) -> Option<([&str; K], usize)> {
++    let mut out = [""; K];
++    let mut pos = at;
++    for (g, slot) in out.iter_mut().enumerate() {
++        if g > 0 {
++            pos = skip_cmap_ws(s, pos);
++        }
++        if s.as_bytes().get(pos) != Some(&b'<') {
++            return None;
++        }
++        let close = pos + 1 + s[pos + 1..].find('>')?;
++        *slot = &s[pos + 1..close];
++        pos = close + 1;
++    }
++    Some((out, pos))
++}
++
++/// Successive non-overlapping leftmost matches of `K` `<…>` groups, i.e.
++/// `captures_iter` over `<([^>]*)>(\s*<([^>]*)>){K-1}`.
++struct AngleGroups<'a, const K: usize> {
++    s: &'a str,
++    pos: usize,
++}
++
++impl<'a, const K: usize> AngleGroups<'a, K> {
++    fn new(s: &'a str) -> Self {
++        Self { s, pos: 0 }
++    }
++}
++
++impl<'a, const K: usize> Iterator for AngleGroups<'a, K> {
++    type Item = [&'a str; K];
++
++    fn next(&mut self) -> Option<Self::Item> {
++        while let Some(off) = self.s[self.pos..].find('<') {
++            let at = self.pos + off;
++            if let Some((groups, end)) = angle_groups_at::<K>(self.s, at) {
++                self.pos = end;
++                return Some(groups);
++            }
++            self.pos = at + 1;
++        }
++        self.pos = self.s.len();
++        None
++    }
++}
++
++/// Leftmost `<lo> <hi> [<d1> <d2> …]`: the two bounds and the array body.
++fn find_bfrange_array(s: &str) -> Option<(&str, &str, &str)> {
++    fn at(s: &str, start: usize) -> Option<(&str, &str, &str)> {
++        let ([lo, hi], end) = angle_groups_at::<2>(s, start)?;
++        let bytes = s.as_bytes();
++        let open = skip_cmap_ws(s, end);
++        if bytes.get(open) != Some(&b'[') {
++            return None;
++        }
++        let body = open + 1;
++        let mut pos = body;
++        let mut entries = 0usize;
++        loop {
++            let p = skip_cmap_ws(s, pos);
++            match bytes.get(p) {
++                Some(b'<') => {
++                    let close = p + 1 + s[p + 1..].find('>')?;
++                    if close == p + 1 {
++                        return None; // `<>` is not an entry
++                    }
++                    pos = close + 1;
++                    entries += 1;
++                },
++                Some(b']') if entries > 0 => return Some((lo, hi, &s[body..p])),
++                _ => return None,
++            }
++        }
++    }
++    let mut from = 0;
++    while let Some(off) = s[from..].find('<') {
++        let start = from + off;
++        if let Some(found) = at(s, start) {
++            return Some(found);
++        }
++        from = start + 1;
++    }
++    None
++}
++
++/// The digits of the leftmost `/WMode <digits> def`.
++fn find_wmode_value(s: &str) -> Option<&str> {
++    let mut from = 0;
++    while let Some(off) = s[from..].find("/WMode") {
++        let at = from + off;
++        let after = at + "/WMode".len();
++        let digits = skip_cmap_ws(s, after);
++        if digits > after {
++            let end = digits
++                + s[digits..]
++                    .bytes()
++                    .take_while(u8::is_ascii_digit)
++                    .count();
++            if end > digits {
++                let def = skip_cmap_ws(s, end);
++                if def > end && s[def..].starts_with("def") {
++                    return Some(&s[digits..end]);
++                }
++            }
++        }
++        from = at + 1;
++    }
++    None
++}
++
++#[cfg(test)]
++mod hand_matcher_tests {
++    use super::*;
++    use regex::Regex;
++
++    /// Deterministic strings over the characters the grammar cares about.
++    fn samples() -> Vec<String> {
++        let alphabet: Vec<char> = "<<<>>>[] \t\n01aF%/WModedef\u{a0}x".chars().collect();
++        let mut out: Vec<String> = [
++            "<0041> <0041>",
++            "<01> <0041> <02> <0042>",
++            "<005F> <0061> [<00660066> <00660069> <00660066006C>]",
++            "<x> <1> <2> [<a>]",
++            "<a <b> <c>",
++            "<0020> <007E> <0020>",
++            "<00><FF>[<>]",
++            "<00> <FF> [ <41> ]",
++            "<00> <FF> []",
++            "/WMode 1 def",
++            "/WMode  12\tdef /WMode 0 def",
++            "/WMode1 def /WMode 1def /WMode 0 def",
++            "",
++        ]
++        .iter()
++        .map(|s| s.to_string())
++        .collect();
++        let mut state = 0x2545F4914F6CDD1Du64;
++        for _ in 0..20000 {
++            let mut s = String::new();
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            let len = (state % 40) as usize;
++            for _ in 0..len {
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                s.push(alphabet[(state % alphabet.len() as u64) as usize]);
++            }
++            out.push(s);
++        }
++        out
++    }
++
++    #[test]
++    fn angle_groups_match_regex() {
++        let pair = Regex::new(r"<([^>]*)>\s*<([^>]*)>").unwrap();
++        let triple = Regex::new(r"<([^>]*)>\s*<([^>]*)>\s*<([^>]*)>").unwrap();
++        let single = Regex::new(r"<([^>]*)>").unwrap();
++        for s in samples() {
++            let want: Vec<Vec<String>> = pair
++                .captures_iter(&s)
++                .map(|c| vec![c[1].to_string(), c[2].to_string()])
++                .collect();
++            let got: Vec<Vec<String>> = AngleGroups::<2>::new(&s)
++                .map(|g| g.iter().map(|x| x.to_string()).collect())
++                .collect();
++            assert_eq!(got, want, "pair on {s:?}");
++
++            let want: Vec<Vec<String>> = single
++                .captures_iter(&s)
++                .map(|c| vec![c[1].to_string()])
++                .collect();
++            let got: Vec<Vec<String>> = AngleGroups::<1>::new(&s)
++                .map(|g| g.iter().map(|x| x.to_string()).collect())
++                .collect();
++            assert_eq!(got, want, "single on {s:?}");
++
++            let want = triple
++                .captures(&s)
++                .map(|c| vec![c[1].to_string(), c[2].to_string(), c[3].to_string()]);
++            let got = AngleGroups::<3>::new(&s)
++                .next()
++                .map(|g| g.iter().map(|x| x.to_string()).collect::<Vec<_>>());
++            assert_eq!(got, want, "triple on {s:?}");
++        }
++    }
++
++    #[test]
++    fn bfrange_array_matches_regex() {
++        let re = Regex::new(r"<([^>]*)>\s*<([^>]*)>\s*\[((?:\s*<[^>]+>\s*)+)\]").unwrap();
++        for s in samples() {
++            let want = re
++                .captures(&s)
++                .map(|c| (c[1].to_string(), c[2].to_string(), c[3].to_string()));
++            let got = find_bfrange_array(&s)
++                .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()));
++            assert_eq!(got, want, "array on {s:?}");
++        }
++    }
++
++    #[test]
++    fn wmode_matches_regex() {
++        let re = Regex::new(r"/WMode\s+([0-9]+)\s+def").unwrap();
++        for s in samples() {
++            let want = re.captures(&s).map(|c| c[1].to_string());
++            let got = find_wmode_value(&s).map(|x| x.to_string());
++            assert_eq!(got, want, "wmode on {s:?}");
++        }
++    }
++}
+diff --git a/src/fonts/font_dict.rs b/src/fonts/font_dict.rs
+index 46dde19..395aea7 100644
+--- a/src/fonts/font_dict.rs
++++ b/src/fonts/font_dict.rs
+@@ -1921,17 +1921,26 @@ impl FontInfo {
+ 
+         // Extract TrueType cmap from descendant's FontDescriptor if available.
+         // Type0 parent fonts often have no embedded data — it's on the CIDFont.
+-        let descendant_tt_cmap = if cid_font_type == "CIDFontType2" {
+-            Self::extract_truetype_cmap_from_descriptor(cidfont_dict, base_font, doc)
+-        } else {
+-            None
+-        };
+-
++        //
+         // Extract embedded font data from CIDFont's FontDescriptor.
+         // Per PDF spec, embedded font programs for Type0 fonts live on the
+         // CIDFont descendant's FontDescriptor, not on the Type0 wrapper.
+-        let descendant_embedded =
+-            Self::extract_embedded_font_from_descriptor(cidfont_dict, base_font, doc);
++        //
++        // The cmap is read out of that same decoded program: /FontFile2 is the
++        // first key the extractor tries, so when it is the one that yielded
++        // data this is byte-for-byte the stream a second decode would produce.
++        let (desc_has_program, desc_data, desc_key) =
++            Self::extract_embedded_font_keyed(cidfont_dict, base_font, doc);
++        let descendant_tt_cmap = match (&desc_data, desc_key) {
++            (Some(data), Some("FontFile2")) if cid_font_type == "CIDFontType2" => {
++                match TrueTypeCMap::from_font_data(data) {
++                    Ok(cmap) if !cmap.is_empty() => Some(cmap),
++                    _ => None,
++                }
++            },
++            _ => None,
++        };
++        let descendant_embedded = (desc_has_program, desc_data);
+ 
+         // Extract ascent/descent from the CIDFont's FontDescriptor (§9.7.4 / Table 117).
+         // The Type0 wrapper has no top-level /FontDescriptor, so these values must be
+@@ -1955,61 +1964,6 @@ impl FontInfo {
+         ))
+     }
+ 
+-    /// Extract TrueType cmap from a font dictionary's /FontDescriptor /FontFile2.
+-    fn extract_truetype_cmap_from_descriptor(
+-        font_dict: &HashMap<String, Object>,
+-        base_font: &str,
+-        doc: &PdfDocument,
+-    ) -> Option<TrueTypeCMap> {
+-        let desc_obj = font_dict.get("FontDescriptor")?;
+-        let desc = if let Some(r) = desc_obj.as_reference() {
+-            doc.load_object(r).ok()?
+-        } else {
+-            desc_obj.clone()
+-        };
+-        let desc_dict = desc.as_dict()?;
+-        let ff2_obj = desc_dict.get("FontFile2")?;
+-        let ff2_ref = ff2_obj.as_reference()?;
+-        let ff2_stream = match doc.load_object(ff2_ref) {
+-            Ok(obj) => obj,
+-            Err(e) => {
+-                log::warn!(
+-                    "Font '{}': Failed to load FontFile2 object {:?}: {}",
+-                    base_font,
+-                    ff2_ref,
+-                    e
+-                );
+-                return None;
+-            },
+-        };
+-        let font_data = match doc.decode_stream_with_encryption(&ff2_stream, ff2_ref) {
+-            Ok(data) => data,
+-            Err(e) => {
+-                log::warn!(
+-                    "Font '{}': Failed to decrypt/decode FontFile2 stream {:?}: {}",
+-                    base_font,
+-                    ff2_ref,
+-                    e
+-                );
+-                return None;
+-            },
+-        };
+-        if font_data.is_empty() {
+-            return None;
+-        }
+-        match TrueTypeCMap::from_font_data(&font_data) {
+-            Ok(cmap) if !cmap.is_empty() => {
+-                log::info!(
+-                    "Font '{}': Extracted TrueType cmap from descendant CIDFont ({} mappings)",
+-                    base_font,
+-                    cmap.len()
+-                );
+-                Some(cmap)
+-            },
+-            _ => None,
+-        }
+-    }
+-
+     /// Read raw /Ascent and /Descent from a font dictionary's /FontDescriptor.
+     /// Returns (raw_ascent, raw_descent) in PDF 1/1000-em units, or None if absent.
+     /// Used to pull ascent/descent off a CIDFont descendant (§9.7.4 / Table 117).
+@@ -2045,28 +1999,30 @@ impl FontInfo {
+ 
+     /// Extract embedded font data from a font dictionary's /FontDescriptor.
+     /// Checks FontFile2 (TrueType), FontFile3 (CFF/OpenType), and FontFile (Type 1).
+-    fn extract_embedded_font_from_descriptor(
++    /// As the embedded-font extraction always did, additionally reporting
++    /// which `/FontFile*` key the returned program came from.
++    fn extract_embedded_font_keyed(
+         font_dict: &HashMap<String, Object>,
+         base_font: &str,
+         doc: &PdfDocument,
+-    ) -> (bool, Option<Arc<Vec<u8>>>) {
++    ) -> (bool, Option<Arc<Vec<u8>>>, Option<&'static str>) {
+         let Some(desc_obj) = font_dict.get("FontDescriptor") else {
+-            return (false, None);
++            return (false, None, None);
+         };
+         let desc = if let Some(r) = desc_obj.as_reference() {
+             match doc.load_object(r) {
+                 Ok(obj) => obj,
+-                Err(_) => return (false, None),
++                Err(_) => return (false, None, None),
+             }
+         } else {
+             desc_obj.clone()
+         };
+         let Some(desc_dict) = desc.as_dict() else {
+-            return (false, None);
++            return (false, None, None);
+         };
+ 
+         // Try FontFile2 (TrueType), FontFile3 (CFF/OpenType), FontFile (Type 1)
+-        let font_file_keys = ["FontFile2", "FontFile3", "FontFile"];
++        let font_file_keys: [&'static str; 3] = ["FontFile2", "FontFile3", "FontFile"];
+         // Key presence ≠ extraction success: callers gating on "the document
+         // embeds its own outlines" must see `true` even when every present
+         // stream fails to load/decode below.
+@@ -2121,11 +2077,11 @@ impl FontInfo {
+                         key,
+                         font_data.len()
+                     );
+-                    return (has_font_program, Some(Arc::new(font_data)));
++                    return (has_font_program, Some(Arc::new(font_data)), Some(*key));
+                 }
+             }
+         }
+-        (has_font_program, None)
++        (has_font_program, None, None)
+     }
+ }
+ 
+diff --git a/src/optional_content.rs b/src/optional_content.rs
+index da9dc1d..1dba2f6 100644
+--- a/src/optional_content.rs
++++ b/src/optional_content.rs
+@@ -229,26 +229,32 @@ pub fn resolve_bdc_properties(
+     let prop_name = properties.as_name()?;
+     let resources = resources?;
+     let doc = doc?;
+-    let res_dict = if let Some(res_ref) = resources.as_reference() {
+-        doc.load_object(res_ref).ok()?
+-    } else {
+-        resources.clone()
++    // Borrow the dictionaries that are already in memory: this runs once per
++    // marked-content sequence, and cloning a page's whole /Resources (or its
++    // /Properties, which can hold thousands of entries) each time made tagged
++    // documents quadratic.
++    let loaded_res;
++    let res_dict = match resources.as_reference() {
++        Some(res_ref) => {
++            loaded_res = doc.load_object(res_ref).ok()?;
++            loaded_res.as_dict()?
++        },
++        None => resources.as_dict()?,
+     };
+-    let res_dict = res_dict.as_dict()?;
+     let properties_dict_obj = res_dict.get("Properties")?;
+-    let properties_dict = if let Some(r) = properties_dict_obj.as_reference() {
+-        doc.load_object(r).ok()?
+-    } else {
+-        properties_dict_obj.clone()
++    let loaded_props;
++    let properties_dict = match properties_dict_obj.as_reference() {
++        Some(r) => {
++            loaded_props = doc.load_object(r).ok()?;
++            loaded_props.as_dict()?
++        },
++        None => properties_dict_obj.as_dict()?,
+     };
+-    let properties_dict = properties_dict.as_dict()?;
+     let prop_obj = properties_dict.get(prop_name)?;
+-    let resolved = if let Some(r) = prop_obj.as_reference() {
+-        doc.load_object(r).ok()?
+-    } else {
+-        prop_obj.clone()
+-    };
+-    resolved.as_dict().cloned()
++    match prop_obj.as_reference() {
++        Some(r) => doc.load_object(r).ok()?.as_dict().cloned(),
++        None => prop_obj.as_dict().cloned(),
++    }
+ }
+ 
+ /// Collect the `/Name` strings of every OCG referenced by an OCMD `/OCGs` entry.

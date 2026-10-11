@@ -1,0 +1,9 @@
+# A fully static, non-relocatable executable: this tool is spawned once per
+# PDF, and dynamic loading plus relocation was a measurable share of each run.
+# Naming the target explicitly keeps these flags off build scripts and
+# proc-macros, which cannot be linked statically.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]

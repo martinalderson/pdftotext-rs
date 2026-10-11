@@ -1,0 +1,31 @@
+[package]
+name = "pdftotext-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A much faster pdftotext-compatible text extractor, built on a patched pdf_oxide"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/martinalderson/pdftotext-rs"
+
+[[bin]]
+name = "pdftotext-rs"
+path = "src/main.rs"
+
+[dependencies]
+pdf_oxide = { path = "vendor/pdf_oxide", default-features = true }
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 16
+
+[workspace]
+exclude = ["vendor"]
+
+# Shipping build: `cargo build --profile dist`
+[profile.dist]
+inherits = "release"
+debug = 0
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
